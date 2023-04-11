@@ -23,7 +23,7 @@ from ninja.params_models import TModels
 from ninja.schema import Schema
 from ninja.signature import ViewSignature, is_async
 from ninja.types import DictStrAny
-from ninja.utils import check_csrf
+from ninja.utils import check_csrf, is_async_callable
 
 if TYPE_CHECKING:
     from ninja import NinjaAPI, Router  # pragma: no cover
@@ -95,8 +95,7 @@ class Operation:
             view_func._ninja_contribute_to_operation(self)  # type: ignore
 
     def run(self, request: HttpRequest, **kw: Any) -> HttpResponseBase:
-        error = self._run_checks(request)
-        if error:
+        if error := self._run_checks(request):
             return error
         try:
             temporal_response = self.api.create_temporal_response(request)
@@ -118,9 +117,8 @@ class Operation:
             if router.auth != NOT_SET:
                 self._set_auth(router.auth)
 
-        if self.tags is None:
-            if router.tags is not None:
-                self.tags = router.tags
+        if self.tags is None and router.tags is not None:
+            self.tags = router.tags
 
     def _set_auth(
         self, auth: Optional[Union[Sequence[Callable], Callable, object]]
@@ -129,17 +127,15 @@ class Operation:
             self.auth_callbacks = isinstance(auth, Sequence) and auth or [auth]
 
     def _run_checks(self, request: HttpRequest) -> Optional[HttpResponse]:
-        "Runs security checks for each operation"
+        """Runs security checks for each operation"""
         # auth:
         if self.auth_callbacks:
-            error = self._run_authentication(request)
-            if error:
+            if error := self._run_authentication(request):
                 return error
 
         # csrf:
         if self.api.csrf:
-            error = check_csrf(request, self.view_func)
-            if error:
+            if error := check_csrf(request, self.view_func):
                 return error
 
         return None
@@ -216,7 +212,7 @@ class Operation:
         for model in self.models:
             try:
                 data = model.resolve(request, self.api, path_params)
-                values.update(data)
+                values |= data
             except pydantic.ValidationError as e:
                 items = []
                 for i in e.errors():
@@ -256,7 +252,7 @@ class AsyncOperation(Operation):
         self.is_async = True
 
     async def run(self, request: HttpRequest, **kw: Any) -> HttpResponseBase:  # type: ignore
-        error = self._run_checks(request)
+        error = await self._run_checks(request)
         if error:
             return error
         try:
@@ -266,6 +262,36 @@ class AsyncOperation(Operation):
             return self._result_to_response(request, result, temporal_response)
         except Exception as e:
             return self.api.on_exception(request, e)
+
+    async def _run_checks(self, request: HttpRequest) -> Optional[HttpResponse]:  # type: ignore
+        """Runs security checks for each operation"""
+        # auth:
+        if self.auth_callbacks:
+            error = await self._run_authentication(request)
+            if error:
+                return error
+
+        # csrf:
+        if self.api.csrf:
+            if error := check_csrf(request, self.view_func):
+                return error
+
+        return None
+
+    async def _run_authentication(self, request: HttpRequest) -> Optional[HttpResponse]:  # type: ignore
+        for callback in self.auth_callbacks:
+            try:
+                if is_async_callable(callback):
+                    result = await callback(request)
+                else:
+                    result = callback(request)
+            except Exception as exc:
+                return self.api.on_exception(request, exc)
+
+            if result:
+                request.auth = result  # type: ignore
+                return None
+        return self.api.on_exception(request, AuthenticationError())
 
 
 class PathView:
@@ -333,11 +359,7 @@ class PathView:
 
     def get_view(self) -> Callable:
         view: Callable
-        if self.is_async:
-            view = self._async_view
-        else:
-            view = self._sync_view
-
+        view = self._async_view if self.is_async else self._sync_view
         view.__func__.csrf_exempt = True  # type: ignore
         return view
 
@@ -360,10 +382,9 @@ class PathView:
         return await sync_to_async(operation.run)(request, *a, **kw)  # type: ignore
 
     def _find_operation(self, request: HttpRequest) -> Optional[Operation]:
-        for op in self.operations:
-            if request.method in op.methods:
-                return op
-        return None
+        return next(
+            (op for op in self.operations if request.method in op.methods), None
+        )
 
     def _not_allowed(self) -> HttpResponse:
         allowed_methods = set()
@@ -373,7 +394,7 @@ class PathView:
 
 
 class ResponseObject:
-    "Basically this is just a helper to be able to pass response to pydantic's from_orm"
+    """Basically this is just a helper to be able to pass response to pydantic's from_orm"""
 
     def __init__(self, response: HttpResponse) -> None:
         self.response = response

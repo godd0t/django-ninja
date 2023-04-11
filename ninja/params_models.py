@@ -22,6 +22,7 @@ __all__ = [
     "BodyModel",
     "FormModel",
     "FileModel",
+    "TModels",
 ]
 
 TModel = TypeVar("TModel", bound="ParamModel")
